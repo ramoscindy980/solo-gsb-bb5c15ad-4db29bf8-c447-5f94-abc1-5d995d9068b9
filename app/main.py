@@ -1,0 +1,103 @@
+"""FastAPI 应用入口：乐谱安全翻页规划 API。"""
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query
+
+from .planner import InfeasibleError, plan_pages
+from .schemas import PlanOut, PlanRequest, PlanSummary
+from .storage import PlanStore
+
+DATABASE_PATH = os.getenv("DATABASE_PATH", "plans.db")
+
+store = PlanStore(DATABASE_PATH)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时完成建库建表
+    store.init()
+    yield
+
+
+app = FastAPI(
+    title="乐谱安全翻页规划 API",
+    version="1.0.0",
+    description=(
+        "提交按顺序排列的谱面系统高度、边界休止秒数、页面可用高度与最低安全休止，"
+        "动态规划生成完整分页方案：页面不超高、仅在达标边界翻页，"
+        "依次最大化最短翻页休止、最小化各页留白平方和、减少页数。"
+    ),
+    lifespan=lifespan,
+)
+
+
+def _to_plan_out(record: dict) -> PlanOut:
+    req, res = record["request"], record["result"]
+    return PlanOut(
+        id=record["id"],
+        created_at=record["created_at"],
+        system_heights=req["system_heights"],
+        boundary_rests=req["boundary_rests"],
+        page_height=req["page_height"],
+        min_safe_rest=req["min_safe_rest"],
+        system_count=len(req["system_heights"]),
+        page_count=res["page_count"],
+        min_turn_rest=res["min_turn_rest"],
+        total_slack_squared=res["total_slack_squared"],
+        pages=res["pages"],
+    )
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/plans", status_code=201, response_model=PlanOut)
+def create_plan(req: PlanRequest) -> PlanOut:
+    """生成并保存完整分页方案；无解时返回 422 及首个问题区间，不保存任何部分方案。"""
+    try:
+        result = plan_pages(
+            req.system_heights,
+            req.boundary_rests,
+            req.page_height,
+            req.min_safe_rest,
+        )
+    except InfeasibleError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "no_feasible_pagination", "reason": exc.reason, **exc.detail},
+        )
+    plan_id = store.insert(req.model_dump(), result)
+    return _to_plan_out(store.get(plan_id))
+
+
+@app.get("/plans", response_model=list[PlanSummary])
+def list_plans(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[PlanSummary]:
+    """列出已保存的方案摘要。"""
+    return [
+        PlanSummary(
+            id=r["id"],
+            created_at=r["created_at"],
+            system_count=len(r["request"]["system_heights"]),
+            page_count=r["result"]["page_count"],
+            min_turn_rest=r["result"]["min_turn_rest"],
+            total_slack_squared=r["result"]["total_slack_squared"],
+        )
+        for r in store.list(limit=limit, offset=offset)
+    ]
+
+
+@app.get("/plans/{plan_id}", response_model=PlanOut)
+def get_plan(plan_id: int) -> PlanOut:
+    """按 ID 查询完整方案。"""
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"plan {plan_id} not found")
+    return _to_plan_out(record)
