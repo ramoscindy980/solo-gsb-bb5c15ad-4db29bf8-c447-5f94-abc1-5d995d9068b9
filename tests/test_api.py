@@ -89,3 +89,74 @@ def test_validation_errors(client):
     # 空系统列表
     r = client.post("/plans", json=dict(GOOD_BODY, system_heights=[], boundary_rests=[]))
     assert r.status_code == 422
+    # 非法排版模式 / 起始侧
+    r = client.post("/plans", json=dict(GOOD_BODY, layout_mode="book"))
+    assert r.status_code == 422
+    r = client.post("/plans", json=dict(GOOD_BODY, layout_mode="spread", spread_start_side="middle"))
+    assert r.status_code == 422
+
+
+SPREAD_BODY = {
+    "system_heights": [6.0, 6.0, 6.0],
+    "boundary_rests": [0.2, 8.0],
+    "page_height": 10.0,
+    "min_safe_rest": 1.0,
+    "layout_mode": "spread",
+    "spread_start_side": "left",
+}
+
+
+def test_layout_mode_defaults_to_single(client):
+    r = client.post("/plans", json=GOOD_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["layout_mode"] == "single"
+    # single 模式响应兼容：不分左右页，每次翻页都是实体翻页
+    for p in plan["pages"]:
+        assert p["side"] is None
+        assert p["physical_turn_after"] == (p["turn_rest_after"] is not None)
+
+
+def test_spread_plan_create_and_replay(client):
+    r = client.post("/plans", json=SPREAD_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["layout_mode"] == "spread"
+    assert plan["spread_start_side"] == "left"
+    assert [p["side"] for p in plan["pages"]] == ["left", "right", "left"]
+    assert [p["physical_turn_after"] for p in plan["pages"]] == [False, True, False]
+    assert plan["min_turn_rest"] == 8.0
+    # 组内边界（页 1→2）不检查休止，也不产生 turn_rest_after
+    assert plan["pages"][0]["turn_rest_after"] is None
+    assert plan["pages"][1]["turn_rest_after"] == 8.0
+
+    # SQLite 回放：新增字段完整返回
+    got = client.get(f"/plans/{plan['id']}")
+    assert got.status_code == 200
+    assert got.json() == plan
+
+    listed = client.get("/plans")
+    assert listed.status_code == 200
+    summary = next(s for s in listed.json() if s["id"] == plan["id"])
+    assert summary["layout_mode"] == "spread"
+
+
+def test_spread_default_start_side_is_left(client):
+    body = {k: v for k, v in SPREAD_BODY.items() if k != "spread_start_side"}
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["spread_start_side"] == "left"
+    assert [p["side"] for p in plan["pages"]] == ["left", "right", "left"]
+
+
+def test_spread_infeasible_diagnosis(client):
+    # 页 2 为右页，其后实体翻页边界 1 休止不足 → 422 且定位该实体翻页边界
+    r = client.post("/plans", json=dict(SPREAD_BODY, boundary_rests=[8.0, 0.2]))
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "no_feasible_pagination"
+    assert detail["reason"] == "unsafe_boundary"
+    assert detail["boundary_index"] == 1
+    assert detail["physical_turn"] is True
+    assert client.get("/plans").json() == []  # 不保存部分方案

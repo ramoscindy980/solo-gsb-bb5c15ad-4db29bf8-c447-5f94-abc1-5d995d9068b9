@@ -110,3 +110,140 @@ def test_zero_min_safe_rest_allows_any_boundary():
     res = plan_pages([6.0, 6.0], [0.0], 10.0, 0.0)
     assert res["page_count"] == 2
     assert res["min_turn_rest"] == 0.0
+
+
+# ---- spread 双页谱架模式 ----
+
+
+def test_single_mode_page_annotations():
+    # single 模式保持兼容：不分左右页，每次翻页都是实体翻页
+    res = plan_pages([5.0, 5.0, 5.0], [5.0, 5.0], 10.0, 1.0)
+    assert [p["side"] for p in res["pages"]] == [None, None]
+    assert [p["physical_turn_after"] for p in res["pages"]] == [True, False]
+
+
+def test_spread_within_group_boundary_needs_no_rest():
+    # 组内（左页→右页）边界休止为 0 也不检查；整曲一个组即可放下时没有任何实体翻页
+    res = plan_pages([6.0, 6.0], [0.0], 10.0, 5.0, layout_mode="spread")
+    assert res["page_count"] == 2
+    assert [p["side"] for p in res["pages"]] == ["left", "right"]
+    assert [p["physical_turn_after"] for p in res["pages"]] == [False, False]
+    assert res["pages"][0]["turn_rest_after"] is None
+    assert res["min_turn_rest"] is None
+
+
+def test_spread_succeeds_where_single_fails():
+    # 同一数据 single 无解（边界 0 休止不足），spread 下边界 0 在组内不检查
+    kwargs = dict(
+        system_heights=[6.0, 6.0, 6.0],
+        boundary_rests=[0.2, 8.0],
+        page_height=10.0,
+        min_safe_rest=1.0,
+    )
+    with pytest.raises(InfeasibleError):
+        plan_pages(**kwargs)
+    res = plan_pages(**kwargs, layout_mode="spread")
+    assert [p["side"] for p in res["pages"]] == ["left", "right", "left"]
+    assert [p["physical_turn_after"] for p in res["pages"]] == [False, True, False]
+    assert res["min_turn_rest"] == 8.0
+    assert res["pages"][1]["turn_rest_after"] == 8.0
+
+
+def test_spread_bottleneck_only_counts_physical_turns():
+    # 每页只能容纳一个系统：组内边界休止 0.1 不参与瓶颈，
+    # 实体翻页休止为 4.0 与 9.0 → 瓶颈 4.0
+    res = plan_pages(
+        [6.0, 6.0, 6.0, 6.0, 6.0],
+        [0.1, 4.0, 0.1, 9.0],
+        10.0,
+        1.0,
+        layout_mode="spread",
+    )
+    assert res["page_count"] == 5
+    assert res["min_turn_rest"] == 4.0
+    assert [p["physical_turn_after"] for p in res["pages"]] == [False, True, False, True, False]
+
+
+def test_spread_start_side_right_turns_after_odd_pages():
+    # 起始页在右侧：第 1 页即右页，页 1→2 边界就需要实体翻页
+    res = plan_pages(
+        [6.0, 6.0, 6.0],
+        [5.0, 0.1],
+        10.0,
+        1.0,
+        layout_mode="spread",
+        spread_start_side="right",
+    )
+    assert [p["side"] for p in res["pages"]] == ["right", "left", "right"]
+    assert [p["physical_turn_after"] for p in res["pages"]] == [True, False, False]
+    assert res["min_turn_rest"] == 5.0
+
+
+def test_spread_start_side_changes_feasibility():
+    # 同一输入下起始侧决定实体翻页落在哪个边界（页码奇偶进入状态）
+    kwargs = dict(
+        system_heights=[6.0, 6.0, 6.0],
+        boundary_rests=[0.2, 8.0],
+        page_height=10.0,
+        min_safe_rest=1.0,
+    )
+    res = plan_pages(**kwargs, layout_mode="spread", spread_start_side="left")
+    assert res["min_turn_rest"] == 8.0  # 实体翻页在边界 1
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(**kwargs, layout_mode="spread", spread_start_side="right")
+    assert exc.value.detail["boundary_index"] == 0  # 实体翻页在边界 0，休止不足
+
+
+def test_spread_slack_minimized_within_single_group():
+    # 全曲可放入一个组（两页），无实体翻页；留白平方和最小化切为 [5,5]|[6,4]
+    res = plan_pages([5.0, 5.0, 6.0, 4.0], [0.0, 0.0, 0.0], 11.0, 1.0, layout_mode="spread")
+    assert res["page_count"] == 2
+    assert res["min_turn_rest"] is None
+    assert res["total_slack_squared"] == pytest.approx(2.0)
+    assert (res["pages"][0]["start_system"], res["pages"][0]["end_system"]) == (0, 1)
+
+
+def test_spread_page_count_tiebreak():
+    # 无实体翻页的 2 页方案（瓶颈视为无穷大）优于任何需要实体翻页的多页方案
+    res = plan_pages([5.0, 5.0, 5.0, 5.0], [5.0, 5.0, 5.0], 10.0, 1.0, layout_mode="spread")
+    assert res["page_count"] == 2
+    assert res["total_slack_squared"] == pytest.approx(0.0)
+
+
+def test_spread_infeasible_reports_first_physical_turn_boundary():
+    # 页 2 是右页，其后的实体翻页边界 1 休止不足
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages([6.0, 6.0, 6.0], [8.0, 0.2], 10.0, 1.0, layout_mode="spread")
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 1
+    assert exc.value.detail["between_systems"] == [1, 2]
+    assert exc.value.detail["physical_turn"] is True
+
+
+def test_spread_diagnosis_skips_safe_physical_turns():
+    # 第一个实体翻页（边界 1，休止 8）安全，第二个（边界 3，休止 0.2）才是首个失败点
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0, 6.0, 6.0, 6.0, 6.0],
+            [0.0, 8.0, 0.0, 0.2],
+            10.0,
+            1.0,
+            layout_mode="spread",
+        )
+    assert exc.value.detail["boundary_index"] == 3
+    assert exc.value.detail["rest_seconds"] == 0.2
+
+
+def test_spread_oversized_system_still_reported_first():
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages([5.0, 12.0], [9.0], 10.0, 1.0, layout_mode="spread")
+    assert exc.value.reason == "system_exceeds_page_height"
+    assert exc.value.detail["system_index"] == 1
+
+
+def test_spread_single_system():
+    res = plan_pages([300.0], [], 1000.0, 2.0, layout_mode="spread", spread_start_side="right")
+    assert res["page_count"] == 1
+    assert res["pages"][0]["side"] == "right"
+    assert res["pages"][0]["physical_turn_after"] is False
+    assert res["min_turn_rest"] is None
