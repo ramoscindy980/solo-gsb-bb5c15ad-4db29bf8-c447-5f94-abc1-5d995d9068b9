@@ -1,9 +1,12 @@
 """请求 / 响应模型。"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
+
+LayoutMode = Literal["single", "spread"]
+SpreadStartSide = Literal["left", "right"]
 
 
 class PlanRequest(BaseModel):
@@ -18,6 +21,14 @@ class PlanRequest(BaseModel):
     )
     page_height: float = Field(..., gt=0, allow_inf_nan=False, description="页面可用高度")
     min_safe_rest: float = Field(..., ge=0, allow_inf_nan=False, description="最低安全休止秒数")
+    layout_mode: LayoutMode = Field(
+        default="single",
+        description="谱架布局：single=单页模式（默认）；spread=双页谱架模式",
+    )
+    spread_start_side: SpreadStartSide = Field(
+        default="left",
+        description="spread 模式下第 1 页所在侧（left/right）；single 模式下忽略",
+    )
 
     @model_validator(mode="after")
     def _check_values(self) -> "PlanRequest":
@@ -35,6 +46,11 @@ class PlanRequest(BaseModel):
 
 
 class PageOut(BaseModel):
+    """单页模式的逐页标注（字段与历史版本完全一致）。"""
+
+    # single 模式严格保持历史响应形状：spread 专有字段通过 extra 字段携带
+    model_config = {"extra": "allow"}
+
     page: int
     start_system: int
     end_system: int
@@ -51,6 +67,8 @@ class PlanOut(BaseModel):
     boundary_rests: list[float]
     page_height: float
     min_safe_rest: float
+    layout_mode: LayoutMode
+    spread_start_side: Optional[SpreadStartSide] = None
     system_count: int
     page_count: int
     min_turn_rest: Optional[float] = None

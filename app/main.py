@@ -27,8 +27,9 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "提交按顺序排列的谱面系统高度、边界休止秒数、页面可用高度与最低安全休止，"
-        "动态规划生成完整分页方案：页面不超高、仅在达标边界翻页，"
-        "依次最大化最短翻页休止、最小化各页留白平方和、减少页数。"
+        "动态规划生成完整分页方案：页面不超高、仅在达标边界完成实体翻页，"
+        "依次最大化最短实体翻页休止、最小化各页留白平方和、减少页数。"
+        "支持 single 单页模式与 spread 双页谱架模式（展开内左右页边界不检查休止）。"
     ),
     lifespan=lifespan,
 )
@@ -36,6 +37,8 @@ app = FastAPI(
 
 def _to_plan_out(record: dict) -> PlanOut:
     req, res = record["request"], record["result"]
+    # 历史请求可能未携带布局参数，回放时按默认 single/left 补齐
+    layout_mode = req.get("layout_mode", "single")
     return PlanOut(
         id=record["id"],
         created_at=record["created_at"],
@@ -43,6 +46,8 @@ def _to_plan_out(record: dict) -> PlanOut:
         boundary_rests=req["boundary_rests"],
         page_height=req["page_height"],
         min_safe_rest=req["min_safe_rest"],
+        layout_mode=layout_mode,
+        spread_start_side=req.get("spread_start_side") if layout_mode == "spread" else None,
         system_count=len(req["system_heights"]),
         page_count=res["page_count"],
         min_turn_rest=res["min_turn_rest"],
@@ -65,6 +70,8 @@ def create_plan(req: PlanRequest) -> PlanOut:
             req.boundary_rests,
             req.page_height,
             req.min_safe_rest,
+            layout_mode=req.layout_mode,
+            spread_start_side=req.spread_start_side,
         )
     except InfeasibleError as exc:
         raise HTTPException(

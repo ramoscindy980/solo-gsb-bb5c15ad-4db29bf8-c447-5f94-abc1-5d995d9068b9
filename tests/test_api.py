@@ -79,6 +79,92 @@ def test_get_missing_plan_404(client):
     assert client.get("/plans/42").status_code == 404
 
 
+def test_single_mode_response_shape_stays_compatible(client):
+    r = client.post("/plans", json=GOOD_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    # 顶层新增 layout_mode，single 下 spread_start_side 为 null
+    assert plan["layout_mode"] == "single"
+    assert plan["spread_start_side"] is None
+    # 逐页对象严格保持历史键集合，不插入 spread 专有字段
+    for p in plan["pages"]:
+        assert set(p.keys()) == {
+            "page", "start_system", "end_system", "system_count",
+            "used_height", "slack", "turn_rest_after",
+        }
+    # 显式 single 同样兼容
+    r2 = client.post("/plans", json=dict(GOOD_BODY, layout_mode="single", spread_start_side="right"))
+    assert r2.status_code == 201
+    plan2 = r2.json()
+    assert plan2["layout_mode"] == "single"
+    assert "side" not in plan2["pages"][0]
+
+
+def test_spread_mode_annotations(client):
+    body = dict(GOOD_BODY, layout_mode="spread", spread_start_side="left")
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["layout_mode"] == "spread"
+    assert plan["spread_start_side"] == "left"
+    n_systems = len(GOOD_BODY["system_heights"])
+    for idx, p in enumerate(plan["pages"]):
+        assert p["side"] in ("left", "right")
+        assert p["side"] == ("left" if (idx + 1) % 2 == 1 else "right")
+        assert isinstance(p["physical_turn_after"], bool)
+        expect_turn = p["side"] == "right" and p["end_system"] != n_systems - 1
+        assert p["physical_turn_after"] is expect_turn
+        if expect_turn:
+            # 实体翻页边界休止达标并计入瓶颈
+            assert p["turn_rest_after"] >= GOOD_BODY["min_safe_rest"]
+        else:
+            # 展开内左->右与末页之后都不是实体翻页
+            assert p["turn_rest_after"] is None
+    physical = [p["turn_rest_after"] for p in plan["pages"] if p["physical_turn_after"]]
+    if physical:
+        assert plan["min_turn_rest"] == min(physical)
+    else:
+        assert plan["min_turn_rest"] is None
+
+    # GET 回放逐页标注
+    got = client.get(f"/plans/{plan['id']}").json()
+    assert got == plan
+
+
+def test_spread_start_right_accepted(client):
+    body = dict(GOOD_BODY, layout_mode="spread", spread_start_side="right")
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    for idx, p in enumerate(r.json()["pages"]):
+        assert p["side"] == ("right" if (idx + 1) % 2 == 1 else "left")
+
+
+def test_spread_infeasible_422_diagnoses_physical_turn(client):
+    # 每页至多容纳 1 个系统；start=left 时首个实体翻页边界（右页后）休止不足
+    bad = dict(
+        GOOD_BODY,
+        system_heights=[140.0] * 5,
+        boundary_rests=[5.0, 0.1, 5.0, 0.1],
+        page_height=150.0,
+        layout_mode="spread",
+        spread_start_side="left",
+    )
+    r = client.post("/plans", json=bad)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "no_feasible_pagination"
+    assert detail["reason"] == "unsafe_boundary"
+    assert detail["turn_side"] == "right"
+    assert client.get("/plans").json() == []
+
+
+def test_invalid_layout_enums(client):
+    r = client.post("/plans", json=dict(GOOD_BODY, layout_mode="book"))
+    assert r.status_code == 422
+    r = client.post("/plans", json=dict(GOOD_BODY, layout_mode="spread", spread_start_side="top"))
+    assert r.status_code == 422
+
+
 def test_validation_errors(client):
     # 边界数量不匹配
     r = client.post("/plans", json=dict(GOOD_BODY, boundary_rests=[1.0]))
